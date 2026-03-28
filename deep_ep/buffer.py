@@ -138,6 +138,11 @@ class Buffer:
             self.group = group
             self.group_size = group.size()
 
+            # If the group uses a CPU-only backend (e.g. gloo), GPU tensor
+            # collectives (all_to_all_single, all_to_all, all_reduce) will fail.
+            # Detect this and lazily create an NCCL sub-group for GPU ops.
+            self._nccl_group = None  # created lazily in _get_gpu_group()
+
             def all_gather_object(obj):
                 object_list = [None] * self.group_size
                 dist.all_gather_object(object_list, obj, group)
@@ -146,6 +151,7 @@ class Buffer:
             self.rank = comm.Get_rank()
             self.group = comm
             self.group_size = comm.Get_size()
+            self._nccl_group = None  # not applicable for mpi4py
 
             def all_gather_object(obj):
                 return comm.allgather(obj)
@@ -218,6 +224,45 @@ class Buffer:
         self._intra_ranks_list = intra_ranks_list
         self._has_inter = len(inter_ranks_list) > 0
         self._half_rdma = self.num_rdma_bytes // 2
+
+    def _get_gpu_group(self) -> dist.ProcessGroup:
+        """Return a process group suitable for GPU tensor collectives.
+
+        If ``self.group`` already supports NCCL operations (i.e. it is an NCCL
+        or NCCL-capable backend), return it directly.  Otherwise, lazily create
+        a matching NCCL sub-group covering the same global ranks and cache it
+        in ``self._nccl_group``.
+
+        The gloo group (``self.group``) is still used for CPU object collectives
+        like ``all_gather_object`` and ``barrier``.
+        """
+        # Fast path: mpi4py comm or already NCCL
+        if not isinstance(self.group, dist.ProcessGroup):
+            return self.group  # mpi4py — caller handles separately
+
+        if self._nccl_group is not None:
+            return self._nccl_group
+
+        # Check if the existing group already supports GPU collectives
+        backend_name = dist.get_backend(self.group)
+        if backend_name == "nccl":
+            self._nccl_group = self.group
+            return self._nccl_group
+
+        # Need to create an NCCL group.  Determine the global ranks in
+        # self.group so we can create a matching NCCL ProcessGroup.
+        # Use dist.get_process_group_ranks() (available since PyTorch 1.13).
+        global_ranks = dist.get_process_group_ranks(self.group)
+        if len(global_ranks) == 0:
+            # Fallback: assume group covers world
+            global_ranks = list(range(self.group_size))
+
+        self._nccl_group = dist.new_group(ranks=global_ranks, backend="nccl")
+        if self.rank == 0:
+            print(f"[DeepEP-EFA] Created NCCL sub-group for GPU collectives "
+                  f"(original backend: {backend_name}, ranks: {global_ranks})",
+                  file=sys.stderr, flush=True)
+        return self._nccl_group
 
     def destroy(self):
         """
@@ -614,7 +659,7 @@ class Buffer:
         # ------------------------------------------------------------------
         send_counts_tensor = num_tokens_per_rank.clone()
         recv_counts_tensor = dmc['recv_counts_tensor']
-        dist.all_to_all_single(recv_counts_tensor, send_counts_tensor, group=self.group)
+        dist.all_to_all_single(recv_counts_tensor, send_counts_tensor, group=self._get_gpu_group())
 
         all_counts = torch.cat([send_counts_tensor, recv_counts_tensor]).tolist()
         send_counts = all_counts[:num_ranks]
@@ -636,7 +681,7 @@ class Buffer:
         # ------------------------------------------------------------------
         gbl_num_tokens_per_expert = dmc['gbl_num_tokens_per_expert']
         gbl_num_tokens_per_expert.copy_(num_tokens_per_expert)
-        dist.all_reduce(gbl_num_tokens_per_expert, group=self.group)
+        dist.all_reduce(gbl_num_tokens_per_expert, group=self._get_gpu_group())
         local_expert_start = rank * num_local_experts
         local_expert_end = local_expert_start + num_local_experts
 
@@ -726,7 +771,7 @@ class Buffer:
                 recv_topk_packed[:total_recv * packed_topk_bpt] if total_recv > 0 else recv_topk_packed[:0],
                 send_topk_packed,
                 output_split_sizes=recv_splits, input_split_sizes=send_splits,
-                group=self.group)
+                group=self._get_gpu_group())
 
             # Unpack
             if total_recv > 0:
@@ -904,7 +949,7 @@ class Buffer:
             dist.all_to_all_single(
                 recv_x_flat.view(-1), send_x_flat.view(-1),
                 output_split_sizes=recv_splits, input_split_sizes=send_splits,
-                group=self.group)
+                group=self._get_gpu_group())
 
         recv_x_scales_out = None
         if is_fp8:
@@ -934,7 +979,7 @@ class Buffer:
             dist.all_to_all_single(
                 recv_x_scales_out.view(-1), send_scales_flat.view(-1),
                 output_split_sizes=recv_s_splits, input_split_sizes=send_s_splits,
-                group=self.group)
+                group=self._get_gpu_group())
 
             # Iter 26: Removed .T.contiguous().T — recv tensor is already row-major contiguous
 
@@ -1078,7 +1123,7 @@ class Buffer:
             remote_recv_offsets_tensor = torch.empty_like(my_offsets_tensor)
             dist.all_to_all_single(
                 remote_recv_offsets_tensor, my_offsets_tensor,
-                group=self.group)
+                group=self._get_gpu_group())
 
             # Get RDMA buffers and start packing on comm_stream
             rdma_send_buf = self.runtime.get_local_buffer_tensor(torch.uint8, 0, True)
@@ -1111,7 +1156,7 @@ class Buffer:
         # Phase 2: NCCL list-based a2a (intra-node, overlaps with pack completion)
         # ==================================================================
         if has_intra:
-            dist.all_to_all(nccl_recv_list, nccl_send_list, group=self.group)
+            dist.all_to_all(nccl_recv_list, nccl_send_list, group=self._get_gpu_group())
 
         # ==================================================================
         # Phase 3: EFA RDMA writes
@@ -1258,7 +1303,7 @@ class Buffer:
             remote_recv_offsets_tensor = torch.empty_like(my_offsets_tensor)
             dist.all_to_all_single(
                 remote_recv_offsets_tensor, my_offsets_tensor,
-                group=self.group)
+                group=self._get_gpu_group())
 
             # Get RDMA buffers and start packing on comm_stream
             rdma_send_buf = self.runtime.get_local_buffer_tensor(torch.uint8, 0, True)
@@ -1317,7 +1362,7 @@ class Buffer:
                     nccl_send_list.append(_empty)
                     nccl_recv_list.append(_empty)
             if has_intra:
-                dist.all_to_all(nccl_recv_list, nccl_send_list, group=self.group)
+                dist.all_to_all(nccl_recv_list, nccl_send_list, group=self._get_gpu_group())
 
         # ==================================================================
         # Phase 3: Single EFA RDMA transfer of packed buffer
@@ -1470,7 +1515,7 @@ class Buffer:
             dist.all_to_all_single(
                 recv_x_flat.view(-1), send_x.view(-1),
                 output_split_sizes=recv_splits, input_split_sizes=send_splits,
-                group=self.group)
+                group=self._get_gpu_group())
 
         # Also all-to-all topk_weights if present (non-EFA path, or post-batch for EFA)
         combined_topk_weights = None
@@ -1486,7 +1531,7 @@ class Buffer:
                 dist.all_to_all_single(
                     recv_w_flat.view(-1), send_w.view(-1),
                     output_split_sizes=recv_w_splits, input_split_sizes=send_w_splits,
-                    group=self.group)
+                    group=self._get_gpu_group())
 
         # ------------------------------------------------------------------
         # Vectorized scatter-add: single index_add_ instead of per-rank loop
@@ -2069,7 +2114,7 @@ class Buffer:
             #   - CPU worker issues RDMA writes
 
             # Phase 2: NCCL count exchange (implicit stream sync with pack kernel)
-            dist.all_to_all_single(recv_counts_tensor, send_counts_tensor, group=self.group)
+            dist.all_to_all_single(recv_counts_tensor, send_counts_tensor, group=self._get_gpu_group())
 
             if prof: prof.mark('nccl_count')
 
@@ -2187,7 +2232,7 @@ class Buffer:
             if prof: prof.mark('pre_efa')
 
             # Use NCCL all-to-all for count exchange (reliable, acts as barrier).
-            dist.all_to_all_single(recv_counts_tensor, send_counts_tensor, group=self.group)
+            dist.all_to_all_single(recv_counts_tensor, send_counts_tensor, group=self._get_gpu_group())
 
             # Pre-dispatch barrier: flush ALL local GPU streams (default stream
             # where unpack/reduce kernels run, NCCL stream), then cross-rank
@@ -2220,7 +2265,7 @@ class Buffer:
         else:
             # === NCCL fallback path (single-node EP8) ===
             slot_size = 0  # contiguous flat layout, no slot-based addressing
-            dist.all_to_all_single(recv_counts_tensor, send_counts_tensor, group=self.group)
+            dist.all_to_all_single(recv_counts_tensor, send_counts_tensor, group=self._get_gpu_group())
 
             if prof: prof.mark('nccl_count')
 
@@ -2253,7 +2298,7 @@ class Buffer:
                 recv_packed[:total_recv * packed_bytes_per_token] if total_recv > 0 else recv_packed[:0],
                 send_packed,
                 output_split_sizes=recv_byte_splits, input_split_sizes=send_byte_splits,
-                group=self.group)
+                group=self._get_gpu_group())
 
             if prof: prof.mark('efa_a2a'); prof.mark('extract_recv')
 
@@ -2691,7 +2736,7 @@ class Buffer:
                 combine_recv_flat[:total_send].view(-1) if total_send > 0 else combine_recv_flat.view(-1)[:0],
                 combine_send_flat.view(-1),
                 output_split_sizes=recv_splits, input_split_sizes=send_splits,
-                group=self.group)
+                group=self._get_gpu_group())
 
             if prof: prof.mark('efa_a2a'); prof.mark('extract_recv')
 
